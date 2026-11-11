@@ -138,7 +138,7 @@ To force a specific MCP configuration on a VM, put an `mcp.json` next to the scr
 Double-click **Update d365fo-mcp** on the Desktop. It works for both ways of installing the server:
 
 - **npm install** (`npm install -g d365fo-mcp`): updates when a newer release is on npm;
-- **git checkout** linked with `npm link`, from the original repository or a fork: updates when the branch it tracks has new commits. It stops if the checkout has uncommitted changes.
+- **git checkout** linked with `npm link`, from the original repository or a fork: updates when the branch it tracks has new commits. It stops if the checkout has uncommitted changes and lists them. A `package-lock.json` rewritten by a previous `npm install` is the exception: it's restored, since the update runs `npm install` again.
 
 When there is something to update (or the C# bridge was built from older sources), it runs `d365fo-mcp update --yes`. If nothing changed, no server is touched. Around the update:
 

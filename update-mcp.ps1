@@ -171,8 +171,19 @@ function Update-D365Mcp {
             return $false
         }
         Write-Field 'Branch' "$(Invoke-Git rev-parse --abbrev-ref HEAD) <- $upstream"
-        if (Invoke-Git status --porcelain --untracked-files=no) {
+        # Only status lines ("XY path"): Invoke-Git also returns whatever git prints on stderr.
+        $changed = @(Invoke-Git status --porcelain --untracked-files=no |
+            Where-Object { $_ -match '^[ MADRCUT]{2} ' } | ForEach-Object { $_.Substring(3) })
+        # `npm install` rewrites package-lock.json when this npm differs from the one that wrote it,
+        # so the previous update leaves it changed. The update runs `npm install` again anyway.
+        if ($changed.Count -eq 1 -and $changed[0] -eq 'package-lock.json') {
+            Invoke-Git checkout HEAD -- package-lock.json | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Fail 'Could not restore package-lock.json.'; return $false }
+            Write-Info 'package-lock.json was changed by a previous npm install: restored.'
+        } elseif ($changed) {
             Write-Fail 'The checkout has uncommitted changes: commit or stash them, then run this again.'
+            $changed | Select-Object -First 10 | ForEach-Object { Write-Dim $_ }
+            if ($changed.Count -gt 10) { Write-Dim "... and $($changed.Count - 10) more" }
             return $false
         }
         $behind = [int](Invoke-Git rev-list --count 'HEAD..@{u}' | Select-Object -First 1)
