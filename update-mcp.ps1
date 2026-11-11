@@ -174,12 +174,16 @@ function Update-D365Mcp {
         # Only status lines ("XY path"): Invoke-Git also returns whatever git prints on stderr.
         $changed = @(Invoke-Git status --porcelain --untracked-files=no |
             Where-Object { $_ -match '^[ MADRCUT]{2} ' } | ForEach-Object { $_.Substring(3) })
-        # `npm install` rewrites package-lock.json when this npm differs from the one that wrote it,
-        # so the previous update leaves it changed. The update runs `npm install` again anyway.
-        if ($changed.Count -eq 1 -and $changed[0] -eq 'package-lock.json') {
-            Invoke-Git checkout HEAD -- package-lock.json | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-Fail 'Could not restore package-lock.json.'; return $false }
-            Write-Info 'package-lock.json was changed by a previous npm install: restored.'
+        # Files the tools rewrite on their own, safe to restore when nothing else changed:
+        # - package-lock.json: `npm install` rewrites it when this npm differs from the one that
+        #   wrote it, so the previous update leaves it changed. The update runs `npm install` again.
+        # - bridge/build-attestation.json: `npm run bridge:build` stamps it after every build. Only
+        #   the repository's CI checks it; the server never reads it.
+        $regenerated = 'package-lock.json', 'bridge/build-attestation.json'
+        if ($changed -and -not ($changed | Where-Object { $_ -notin $regenerated })) {
+            Invoke-Git checkout HEAD -- @changed | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Fail "Could not restore $($changed -join ', ')."; return $false }
+            Write-Info "Restored $($changed -join ', '): rewritten by an earlier npm install or bridge build."
         } elseif ($changed) {
             Write-Fail 'The checkout has uncommitted changes: commit or stash them, then run this again.'
             $changed | Select-Object -First 10 | ForEach-Object { Write-Dim $_ }
