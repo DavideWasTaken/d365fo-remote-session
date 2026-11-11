@@ -1,7 +1,8 @@
 # d365fo-remote-session: a disposable Claude Code or Codex remote session for a customer VM.
 #
-# 1. Asks once which agent to use (Claude Code, or Codex - experimental) and the session name,
-#    and keeps both in session.ini next to this script. Installs the agent's CLI if it is missing.
+# 1. Asks which agent to use (Claude Code, or Codex - experimental) on every launch, so both can
+#    run side by side, and the session name once, kept in session.ini next to this script.
+#    Installs the agent's CLI if it is missing.
 # 2. Points CLAUDE_CONFIG_DIR / CODEX_HOME at a throwaway folder in %TEMP%: credentials, history
 #    and transcripts go there instead of %USERPROFILE%\.claude or \.codex.
 # 3. Copies the MCP servers already configured on the VM (Claude Code and Claude Desktop).
@@ -19,7 +20,7 @@
 #           -McpUrl <url>
 
 param(
-    # claude or codex; empty = session.ini, asked on first run.
+    # claude or codex; empty = asked on every launch.
     [ValidateSet('claude', 'codex')]
     [string]$Agent = '',
     # Start folder; empty = %USERPROFILE%\source\repos (or the user profile).
@@ -98,9 +99,9 @@ function Write-JsonFile([string]$path, $value) {
     [IO.File]::WriteAllText($path, $json.Serialize($value))
 }
 
-# session.ini: one key=value per line (name, agent).
+# session.ini: one key=value per line (name). Older versions also kept the agent there.
 function Read-SessionSettings {
-    $settings = @{ name = ''; agent = '' }
+    $settings = @{ name = '' }
     if (Test-Path $settingsFile) {
         foreach ($line in Get-Content $settingsFile -Encoding UTF8) {
             if ($line -match '^\s*(\w+)\s*=\s*(.*?)\s*$') { $settings[$Matches[1].ToLower()] = $Matches[2] }
@@ -112,7 +113,7 @@ function Read-SessionSettings {
 }
 
 function Save-SessionSettings($settings) {
-    "name=$($settings.name)", "agent=$($settings.agent)" | Set-Content -Path $settingsFile -Encoding UTF8
+    "name=$($settings.name)" | Set-Content -Path $settingsFile -Encoding UTF8
     if (Test-Path $legacyNameFile) { Remove-Item $legacyNameFile -ErrorAction SilentlyContinue }
 }
 
@@ -660,24 +661,16 @@ $signInStarted = $false
 
 Write-Banner
 
-# Agent and session name: asked once, then read from session.ini (edit it to change them).
+# Agent: asked on every launch, so Claude Code and Codex can run side by side from the same
+# launcher. Session name: asked once, then read from session.ini (edit it to change it).
 $settings = Read-SessionSettings
 $changed = -not (Test-Path $settingsFile)
 if (-not $Agent) {
     # $Agent keeps its ValidateSet: only ever assign it claude or codex.
-    $saved = $settings.agent.ToLower()
-    if ($saved -in 'claude', 'codex') {
-        $Agent = $saved
-    } else {
-        Write-Host ""
-        Write-Host "         Agent    [1] Claude Code   [2] Codex (experimental)"
-        $choice = (Read-Host "         Choose [Enter = 1]").Trim()
-        $Agent = if ($choice -in '2', 'codex') { 'codex' } else { 'claude' }
-        $settings.agent = $Agent
-        $changed = $true
-    }
-} elseif (-not $settings.agent) {
-    $settings.agent = $Agent
+    Write-Host ""
+    Write-Host "         Agent    [1] Claude Code   [2] Codex (experimental)"
+    $choice = (Read-Host "         Choose [Enter = 1]").Trim()
+    $Agent = if ($choice -in '2', 'codex') { 'codex' } else { 'claude' }
 }
 if (-not $Name) {
     $Name = $settings.name
@@ -776,6 +769,9 @@ try {
         $dir = Join-Path $env:TEMP ($prefix + [guid]::NewGuid().ToString('N'))
     }
     New-Item -ItemType Directory -Path $dir | Out-Null
+    # The launcher's PID: while it runs, another launcher (Claude and Codex side by side) leaves this
+    # folder alone, also during sign-in. Claude Code's remote-control PID replaces it once it starts.
+    $PID | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
     Write-Ok "Throwaway config folder ready"
     Write-Dim $dir
 
@@ -906,9 +902,6 @@ try {
     Write-Step "Remote session"
 
     if ($isCodex) {
-        # The launcher's PID: while it runs, the next launcher leaves this folder alone.
-        $PID | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
-
         # Run codex.exe (or codex.js under node) rather than the codex.cmd shim: Ctrl+C on a batch
         # file asks "Terminate batch job (Y/N)?" and would hang the shutdown.
         $rcFile = $codex

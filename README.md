@@ -24,7 +24,7 @@ This script lets you:
 
 ## What it does
 
-1. **Asks once which agent to use**, Claude Code or Codex, and **installs its CLI** if it isn't there yet (Claude with the official installer, Codex with `npm install -g @openai/codex`). The choice is saved with the session name in `session.ini`.
+1. **Asks which agent to use on every launch**, Claude Code or Codex, so you can run both side by side, and **installs its CLI** if it isn't there yet (Claude with the official installer, Codex with `npm install -g @openai/codex`).
 2. **Creates a throwaway config folder** in `%TEMP%` and points `CLAUDE_CONFIG_DIR` or `CODEX_HOME` at it, so nothing is written to `%USERPROFILE%\.claude` or `\.codex`.
 3. **Finds your MCP servers** in the Claude Code and Claude Desktop configs (plus an optional `mcp.json` next to the script). If no `d365` server is configured it adds `http://127.0.0.1:8080/mcp`. If the server doesn't answer, it starts it with `d365fo-mcp start`.
 4. **Signs you in without touching the VM's browser.** The sign-in link is copied to the clipboard, which RDP shares with your PC. Claude: open it on your own machine and paste the code back, masked with `*`. Codex: open it on your own machine and type the code the console shows (device code sign-in), nothing is typed on the VM.
@@ -46,29 +46,30 @@ On the VM, open PowerShell and run:
 irm https://raw.githubusercontent.com/DavideWasTaken/d365fo-remote-session/main/install.ps1 | iex
 ```
 
-It asks for a session name (for example the customer's name, or press Enter to use the computer name) and the agent, Claude Code or Codex, then creates:
+It asks for a session name (for example the customer's name, or press Enter to use the computer name), then creates:
 
 - `Documents\remote-session\remote-session.ps1`: the script;
-- `Documents\remote-session\session.ini`: the session name and the agent, which you can edit at any time;
+- `Documents\remote-session\session.ini`: the session name, which you can edit at any time;
 - `Desktop\Remote Session.cmd`: the double-click launcher;
 - `Documents\remote-session\update-mcp.ps1` and `Desktop\Update d365fo-mcp.cmd`: the d365fo-mcp updater, only if `d365fo-mcp` is installed (see [Updating d365fo-mcp](#updating-d365fo-mcp)).
 
-`session.ini` looks like this; set `agent` to `claude` or `codex` to switch:
+`session.ini` looks like this:
 
 ```ini
 name=Contoso
-agent=claude
 ```
 
-Run the same command again to update the script. Your settings are kept. An install of the old `d365fo-claude-remote-session` is replaced: its session name and `mcp.json` are carried over, and the old folder and launcher are removed.
+The agent isn't saved: the launcher asks for it every time.
 
-If you'd rather install by hand, copy `remote-session.ps1` and `remote-session.cmd` into the same folder and double-click the `.cmd`. It asks for the agent and the session name on the first run. The updater works the same way: `update-mcp.ps1` and `update-mcp.cmd`.
+Run the same command again to update the script. The session name is kept. An install of the old `d365fo-claude-remote-session` is replaced: its session name and `mcp.json` are carried over, and the old folder and launcher are removed.
+
+If you'd rather install by hand, copy `remote-session.ps1` and `remote-session.cmd` into the same folder and double-click the `.cmd`. It asks for the session name on the first run and for the agent every time. The updater works the same way: `update-mcp.ps1` and `update-mcp.cmd`.
 
 ## Usage
 
 ### Claude Code
 
-1. Double-click **Remote Session** on the Desktop.
+1. Double-click **Remote Session** on the Desktop and press **1** (or Enter).
 2. Paste the sign-in link (it's already in your clipboard) into the browser on **your** PC, sign in, copy the code and paste it into the VM console.
 3. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 4. Open the session from the Claude app on your PC and tell it what to work on, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
@@ -79,13 +80,17 @@ You can also type **"stop session"** in the chat or press Ctrl+C in the VM conso
 
 ### Codex (experimental)
 
-1. Double-click **Remote Session** on the Desktop.
+1. Double-click **Remote Session** on the Desktop and press **2**.
 2. Paste the sign-in link (it's already in your clipboard) into the browser on **your** PC, sign in to ChatGPT and type the code shown in the VM console.
 3. The console then shows a **pairing code** (also copied to the clipboard). In the ChatGPT app on your computer or phone, add a remote computer for Codex and enter it. The code is short-lived: press **P** in the console for a new one.
 4. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 5. Pick the VM in the app (it's listed under its **computer name**: Codex has no session name) and start a thread, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
 
 To end the session, type **"stop session"** in the chat, press **Q** or Ctrl+C in the VM console, or sign out of Codex from the app. The script stops Codex, signs out and deletes the temp folder.
+
+### Claude Code and Codex together
+
+Double-click **Remote Session** twice: press **1** in one window and **2** in the other. Each session has its own console, sign-in and throwaway folder, and both use the same d365 MCP server. Ending one leaves the other running.
 
 ### Console
 
@@ -94,6 +99,9 @@ The console walks you through five steps. With Claude Code:
 ```
   D365FO Remote Session
   ---------------------
+
+         Agent    [1] Claude Code   [2] Codex (experimental)
+         Choose [Enter = 1]: 1
 
 [1/5] Claude Code
   [ OK ] Claude Code 2.1.310
@@ -121,7 +129,7 @@ You only need these when running the script from PowerShell instead of double-cl
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `-Agent` | `session.ini`, or asked on first run | `claude` or `codex` |
+| `-Agent` | asked on every launch | `claude` or `codex` |
 | `-Project` | `%USERPROFILE%\source\repos` | Starting folder |
 | `-Name` | `session.ini`, or asked on first run | Session name shown in the Claude app |
 | `-ExtraDirs` | all local fixed drives | Folders the agent may access |

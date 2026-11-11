@@ -1,5 +1,5 @@
 # Installs d365fo-remote-session:
-# - Documents\remote-session\remote-session.ps1 and session.ini (session name and agent)
+# - Documents\remote-session\remote-session.ps1 and session.ini (session name)
 # - Desktop\Remote Session.cmd, the double-click launcher
 # - Documents\remote-session\update-mcp.ps1 and Desktop\Update d365fo-mcp.cmd, when d365fo-mcp is installed
 # Replaces an install of the old d365fo-claude-remote-session, keeping its session name.
@@ -42,8 +42,9 @@ try {
     if ($updating) { Write-Host "  [ OK ] Script updated ($version)" -ForegroundColor Green }
     else { Write-Host "  [ OK ] Script downloaded ($version)" -ForegroundColor Green }
 
-    # Keep name and agent on reinstall/update; take the name over from the old install.
-    $settings = @{ name = ''; agent = '' }
+    # Keep the name on reinstall/update; take it over from the old install. The agent is asked on
+    # every launch, so an agent= line from an earlier version is dropped.
+    $settings = @{ name = '' }
     if (Test-Path $settingsFile) {
         foreach ($line in Get-Content $settingsFile -Encoding UTF8) {
             if ($line -match '^\s*(\w+)\s*=\s*(.*?)\s*$') { $settings[$Matches[1].ToLower()] = $Matches[2] }
@@ -51,24 +52,14 @@ try {
     }
     $oldNameFile = Join-Path $oldDir 'session-name.txt'
     if (-not $settings.name -and (Test-Path $oldNameFile)) { $settings.name = (Get-Content $oldNameFile -Raw).Trim() }
-    # The old install only ran Claude Code.
-    if (-not $settings.agent -and (Test-Path $oldDir)) { $settings.agent = 'claude' }
 
     if (-not $settings.name) {
         Write-Host ""
         $settings.name = (Read-Host "         Session name, e.g. the customer [Enter = $env:COMPUTERNAME]").Trim()
         if (-not $settings.name) { $settings.name = $env:COMPUTERNAME }
     }
-    if ($settings.agent -notin 'claude', 'codex') {
-        Write-Host ""
-        Write-Host "         Agent    [1] Claude Code   [2] Codex (experimental)"
-        $choice = (Read-Host "         Choose [Enter = 1]").Trim()
-        $settings.agent = if ($choice -in '2', 'codex') { 'codex' } else { 'claude' }
-    }
-    "name=$($settings.name)", "agent=$($settings.agent)" | Set-Content -Path $settingsFile -Encoding UTF8
-    $agentName = if ($settings.agent -eq 'codex') { 'Codex' } else { 'Claude Code' }
+    "name=$($settings.name)" | Set-Content -Path $settingsFile -Encoding UTF8
     Write-Host "  [ OK ] Session name: $($settings.name)" -ForegroundColor Green
-    Write-Host "  [ OK ] Agent: $agentName" -ForegroundColor Green
 
     @"
 @echo off
@@ -111,10 +102,10 @@ pause
     Write-Host ("         {0,-9}{1}" -f 'Launcher', $launcher) -ForegroundColor DarkGray
     if ($hasMcp) { Write-Host ("         {0,-9}{1}" -f 'Updater', $updaterLauncher) -ForegroundColor DarkGray }
     Write-Host ""
-    Write-Host "  Double-click 'Remote Session' on the Desktop to start." -ForegroundColor Green
+    Write-Host "  Double-click 'Remote Session' on the Desktop to start; it asks for Claude Code or Codex each time." -ForegroundColor Green
     if ($hasMcp) { Write-Host "  Double-click 'Update d365fo-mcp' to update the MCP server and restart it." -ForegroundColor Green }
     else { Write-Host "  d365fo-mcp isn't installed: run this installer again after installing it to get its updater." -ForegroundColor DarkGray }
-    Write-Host "  Edit session.ini to change the name or switch between claude and codex." -ForegroundColor DarkGray
+    Write-Host "  Edit session.ini to change the name." -ForegroundColor DarkGray
     Write-Host ""
 }
 catch {
