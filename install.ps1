@@ -79,6 +79,10 @@ pause
     Write-Host "  [ OK ] Desktop launcher created" -ForegroundColor Green
 
     # The d365fo-mcp updater only makes sense where the server is installed.
+    # A PowerShell window keeps the PATH it was opened with, so d365fo-mcp (or Node.js) installed
+    # since then isn't found: add the PATH saved in the registry before looking.
+    $env:Path = (@($env:Path) + [Environment]::GetEnvironmentVariable('Path', 'Machine') +
+        [Environment]::GetEnvironmentVariable('Path', 'User')) -join ';'
     $hasMcp = [bool](Get-Command d365fo-mcp -ErrorAction SilentlyContinue)
     if ($hasMcp) {
         Invoke-WebRequest "$repoRaw/update-mcp.ps1" -OutFile $updater -UseBasicParsing
