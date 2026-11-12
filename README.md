@@ -83,7 +83,7 @@ To stop for now and resume later, type **"stop session"** in the chat or press C
 
 1. Double-click **Remote Session** on the Desktop and press **2**.
 2. Paste the sign-in link (it's already in your clipboard) into the browser on **your** PC, sign in to ChatGPT and type the code shown in the VM console.
-3. The console then shows a **pairing code** (also copied to the clipboard). In the ChatGPT app on your computer or phone, add a remote computer for Codex and enter it. The code is short-lived: press **P** in the console for a new one.
+3. The first time, the console then shows a **pairing code** (also copied to the clipboard). In the ChatGPT app on your computer or phone, add a remote computer for Codex and enter it. The code is short-lived: press **P** in the console for a new one. The pairing is kept for next time (see [Resuming a conversation](#resuming-a-conversation)), so later you only sign in. If the app doesn't show the VM, press **P** and pair again.
 4. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 5. Pick the VM in the app (it's listed under its **computer name**: Codex has no session name) and start a thread, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
 
@@ -105,7 +105,9 @@ Conversations are kept when a session stops without being archived: with "stop s
   ```
 
   Move with the arrows (or press the number) and press Enter to resume one, or Enter on *New session* (Esc) for a new one. **Del** (or **D**) deletes the highlighted conversation, after asking you to confirm with **Y**. Then sign in as usual. The session shows up in the Claude app as a **new entry** under the same name, with the whole earlier conversation, and runs in the folder it ran in before. It also shows in the VM console. To end a resumed session, type **"stop session"**: archiving it in the app doesn't stop it. It is kept again, so you can resume it once more.
-- **Codex** shows the same list, with the thread names from the app. There you only delete the ones you don't want (**Del**). Enter continues: after signing in and pairing, the ChatGPT app lists the threads left under the VM, and you continue the one you want there.
+- **Codex** shows the same list, with the thread names from the app. There you only delete the ones you don't want (**Del**). Enter continues: after signing in, the ChatGPT app lists the threads left under the VM, and you continue the one you want there.
+
+  Codex registers the VM with the ChatGPT app as a remote computer, and a new registration has to be paired again and shows up without the earlier threads. So the registration is kept too: from Codex's state database only the `remote_control_enrollments` table (the computer's ids and name), everything else in it emptied, plus Codex's `installation_id`. The next session registers as the same computer.
 
 What is kept is only the transcripts: no login token, no account settings, no skills or plugins synced from your account. Claude Code writes your email into the transcript's context: it is replaced with `redacted` before saving. Each conversation is deleted 7 days after its last use (`-KeepDays` changes that; `-KeepDays 0` keeps nothing).
 
@@ -182,7 +184,7 @@ The metadata index is not rebuilt. Run `d365fo-mcp index` by hand after a D365FO
 This reduces exposure a lot, but on a machine where others are administrators it can't make you invisible. Be aware that:
 
 - **While the session runs**, the login token is in the temp folder and in process memory. A local admin, or an Azure admin taking a disk snapshot, could read it. When the session ends it is signed out and deleted.
-- **Saved conversations stay on the VM for up to 7 days** (`%LOCALAPPDATA%\remote-session\saved`), readable by anyone using the same Windows account. They contain only what was said and done on that VM: your messages, the answers, the files and command output the agent saw. Your other chats and your account stay out of reach, because no login is kept. They still carry account and organization IDs (not your email), and Codex threads your ChatGPT user ID. Archive the session in the app, delete it from the list at the next launch, or use `-KeepDays 0` if nothing at all should stay.
+- **Saved conversations stay on the VM for up to 7 days** (`%LOCALAPPDATA%\remote-session\saved`), readable by anyone using the same Windows account. They contain only what was said and done on that VM: your messages, the answers, the files and command output the agent saw. Your other chats and your account stay out of reach, because no login is kept. They still carry account and organization IDs (not your email), and Codex threads your ChatGPT user ID. Codex's saved pairing holds the VM's ids with your ChatGPT account ID, not a login: without signing in, nobody can connect to it. Archive the session in the app, delete it from the list at the next launch, or use `-KeepDays 0` if nothing at all should stay.
 - **Deleted files are removed normally, not wiped**, so forensic recovery is possible.
 - **The session runs without approvals** (`bypassPermissions` for Claude, `approval_policy = "never"` with no sandbox for Codex): the agent executes commands, edits files and runs MCP tools such as SQL queries without asking. Keep that in mind on customer environments.
 - **Codex remote control is experimental.** On Windows the Codex background daemon refuses to run as administrator, and LCS VMs run the admin account elevated, often with UAC off. So the script runs `codex remote-control --no-daemon` in the foreground and requests the pairing code from its local socket itself, with the same request `codex remote-control pair` sends to the daemon. A future Codex release could change that request.

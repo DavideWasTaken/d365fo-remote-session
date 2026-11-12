@@ -381,7 +381,101 @@ function Save-CodexConversations([string]$codexHome) {
         }
         [IO.File]::WriteAllLines($savedIndex, [string[]]@($byId.Values))
     }
+
+    try { Save-CodexIdentity $codexHome } catch { Write-Warn "Couldn't keep this computer's pairing with the app: $($_.Exception.Message)" }
     return @(Get-ChildItem $src -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue).Count
+}
+
+# Codex registers itself with the ChatGPT app as a remote computer and keeps that registration in
+# its state database (state_N.sqlite, table remote_control_enrollments). A new CODEX_HOME registers
+# a new computer, which has to be paired again and shows up in the app without the earlier threads.
+# Only that table is kept: everything else in the database is emptied (Codex indexes the threads
+# again from their files). Uses the SQLite that comes with Windows.
+function Initialize-CodexState {
+    if ('CodexState' -as [type]) { return }
+    Add-Type @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class CodexState {
+    [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_open16", CharSet = CharSet.Unicode)] static extern int Open(string path, out IntPtr db);
+    [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_close")] static extern int Close(IntPtr db);
+    [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_prepare16_v2", CharSet = CharSet.Unicode)] static extern int Prepare(IntPtr db, string sql, int bytes, out IntPtr stmt, IntPtr tail);
+    [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_step")] static extern int Step(IntPtr stmt);
+    [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_finalize")] static extern int Finalize(IntPtr stmt);
+    [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_column_text16")] static extern IntPtr ColumnText(IntPtr stmt, int col);
+    [DllImport("winsqlite3.dll", EntryPoint = "sqlite3_errmsg16")] static extern IntPtr ErrorMessage(IntPtr db);
+
+    // Runs a statement and returns the first column of each row.
+    static List<string> Run(IntPtr db, string sql) {
+        IntPtr stmt;
+        if (Prepare(db, sql, -1, out stmt, IntPtr.Zero) != 0) throw new Exception(Marshal.PtrToStringUni(ErrorMessage(db)));
+        var rows = new List<string>();
+        try {
+            while (true) {
+                int rc = Step(stmt);
+                if (rc == 100) { rows.Add(Marshal.PtrToStringUni(ColumnText(stmt, 0))); continue; }
+                if (rc == 101) break;
+                throw new Exception(Marshal.PtrToStringUni(ErrorMessage(db)));
+            }
+        } finally { Finalize(stmt); }
+        return rows;
+    }
+
+    // Empties every table but the enrollments (and sqlx's migration list, so Codex sees an
+    // up-to-date schema), folds the WAL into the file and returns how many enrollments are left.
+    public static int KeepEnrollments(string path) {
+        IntPtr db;
+        if (Open(path, out db) != 0) throw new Exception("Can't open " + path);
+        try {
+            foreach (var table in Run(db, "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")) {
+                if (table == "remote_control_enrollments" || table == "_sqlx_migrations") continue;
+                Run(db, "DELETE FROM \"" + table.Replace("\"", "\"\"") + "\"");
+            }
+            int count = int.Parse(Run(db, "SELECT count(*) FROM remote_control_enrollments")[0]);
+            Run(db, "PRAGMA journal_mode = DELETE");
+            Run(db, "VACUUM");
+            return count;
+        } finally { Close(db); }
+    }
+}
+'@
+}
+
+# Keeps this computer's registration with the ChatGPT app, and Codex's installation id, in
+# saved\codex. Nothing is overwritten when the session has no registration.
+function Save-CodexIdentity([string]$codexHome) {
+    $state = Get-ChildItem $codexHome -Filter 'state_*.sqlite' -File -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $state) { return }
+    $folder = Join-Path $savedRoot 'codex'
+    $work = Join-Path $folder 'state.tmp'
+    if (Test-Path $work) { Remove-Item $work -Recurse -Force }
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        # Its -wal and -shm too: what Codex wrote last may still be there.
+        Get-ChildItem $codexHome -Filter "$($state.Name)*" -File | Copy-Item -Destination $work
+        Initialize-CodexState
+        $copy = Join-Path $work $state.Name
+        if ([CodexState]::KeepEnrollments($copy) -gt 0) {
+            Get-ChildItem $folder -Filter 'state_*.sqlite' -File | Remove-Item -Force
+            Move-Item $copy $folder
+            $id = Join-Path $codexHome 'installation_id'
+            if (Test-Path $id) { Copy-Item $id $folder -Force }
+        }
+    } finally {
+        Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Puts the saved registration in a new CODEX_HOME; returns $true when there was one.
+function Restore-CodexIdentity([string]$codexHome) {
+    $folder = Join-Path $savedRoot 'codex'
+    $state = Get-ChildItem $folder -Filter 'state_*.sqlite' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $state) { return $false }
+    Copy-Item $state.FullName $codexHome
+    $id = Join-Path $folder 'installation_id'
+    if (Test-Path $id) { Copy-Item $id $codexHome }
+    return $true
 }
 
 # Keeps the conversations of a session folder; returns how many were kept.
@@ -948,6 +1042,7 @@ $restoreCodex = $false
 $archived = $false
 $keptCount = 0
 $sessionStart = $null
+$paired = $false
 
 Write-Banner
 
@@ -1094,6 +1189,11 @@ try {
         $savedIndex = Join-Path $savedRoot 'codex\session_index.jsonl'
         if (Test-Path $savedIndex) { Copy-Item $savedIndex (Join-Path $dir 'session_index.jsonl') }
         Write-Ok "Saved conversations restored"
+    }
+    $paired = $false
+    if ($isCodex -and $KeepDays) {
+        $paired = Restore-CodexIdentity $dir
+        if ($paired) { Write-Ok "Pairing with the ChatGPT app restored" }
     }
 
     # -------------------------------------------------------------- 3. MCP servers
@@ -1273,11 +1373,18 @@ try {
         Write-Field 'Machine' "$serverName  (Codex shows the computer name, not '$Name')"
         Write-Field 'Mode' 'never ask for approval, no sandbox'
         Write-Host ""
-        Show-PairingCode
-        Write-Info "In the ChatGPT app on your computer or phone: Codex > add a remote computer > enter the code."
-        Write-Info "Then pick '$serverName' and start a thread. You can close RDP now with the X - do NOT sign out."
+        if ($paired) {
+            # Same registration as last time: the app should still list this computer as paired.
+            Write-Info "'$serverName' should already be in the ChatGPT app: open it there and pick or start a thread."
+            Write-Info "If the app doesn't show it, press P here for a pairing code (Codex > add a remote computer)."
+        } else {
+            Show-PairingCode
+            Write-Info "In the ChatGPT app on your computer or phone: Codex > add a remote computer > enter the code."
+            Write-Info "Then pick '$serverName' and start a thread."
+        }
+        Write-Info "You can close RDP now with the X - do NOT sign out."
         Write-Info "To end it: 'stop session' in the chat, Q or Ctrl+C here, or sign out of Codex from the app."
-        Write-Dim "P here makes a new pairing code if this one expired."
+        Write-Dim "P here makes a new pairing code."
         Write-Host ""
 
         while (-not $rc.HasExited) {
