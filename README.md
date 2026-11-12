@@ -19,7 +19,7 @@ If you install the Claude or ChatGPT desktop app there and sign in, your whole a
 This script lets you:
 
 - **set up a remote session in seconds:** double-click, sign in, close RDP, then work from the Claude or ChatGPT app on your own PC;
-- **keep your account off the VM:** credentials, history and transcripts live in a temporary folder that is deleted when the session ends;
+- **keep your account off the VM:** credentials, settings and history live in a temporary folder that is deleted when the session ends. Only the conversations held on that VM are kept, for 7 days, so you can resume them;
 - **run one session per customer:** with Claude each VM shows up under its own name in your session list, so you always know which machine you are talking to (Codex lists it under the computer name).
 
 ## What it does
@@ -30,6 +30,7 @@ This script lets you:
 4. **Signs you in without touching the VM's browser.** The sign-in link is copied to the clipboard, which RDP shares with your PC. Claude: open it on your own machine and paste the code back, masked with `*`. Codex: open it on your own machine and type the code the console shows (device code sign-in), nothing is typed on the VM.
 5. **Starts the remote session** with no permission prompts. Claude: `claude remote-control`, with no "Enable Remote Control?" question. Codex: `codex remote-control --no-daemon` with `approval_policy = "never"` and no sandbox, plus a pairing code for the ChatGPT app. It can access every local drive, so you just tell it which project to work on.
 6. **Cleans up when you're done:** clean shutdown of the agent and its child processes (for Codex, its remote-control server too), sign-out, and the temp folder is deleted, including paths longer than 260 characters. Leftovers from sessions that ended badly are removed on the next run.
+7. **Keeps the conversations so you can resume them** (see [Resuming a conversation](#resuming-a-conversation)): just the transcripts, without the login or anything else from your account, in `%LOCALAPPDATA%\remote-session\saved`, for 7 days after their last use. A session you archive in the app isn't kept.
 
 ## Requirements
 
@@ -74,9 +75,9 @@ If you'd rather install by hand, copy `remote-session.ps1` and `remote-session.c
 3. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 4. Open the session from the Claude app on your PC and tell it what to work on, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
 
-To end the session, **archive it from the Claude app**. In single-session mode Remote Control exits when its session ends, and the script then signs out and deletes the temp folder. Archiving is also what removes the session from your list.
+To end the session for good, **archive it from the Claude app**. In single-session mode Remote Control exits when its session ends, and the script then signs out and deletes the temp folder, conversation included. Archiving is also what removes the session from your list.
 
-You can also type **"stop session"** in the chat or press Ctrl+C in the VM console. The cleanup is the same, but Claude Code deliberately keeps a session stopped this way so it can be resumed, so it stays in your list as offline until you archive it.
+To stop for now and resume later, type **"stop session"** in the chat or press Ctrl+C in the VM console. The cleanup is the same, but the conversation is kept (see [Resuming a conversation](#resuming-a-conversation)). Claude Code also keeps a session stopped this way in your list as offline until you archive it.
 
 ### Codex (experimental)
 
@@ -86,7 +87,26 @@ You can also type **"stop session"** in the chat or press Ctrl+C in the VM conso
 4. Close the RDP window with the **X**. Don't use *Sign out*: that would end the session.
 5. Pick the VM in the app (it's listed under its **computer name**: Codex has no session name) and start a thread, for example *"use project 1311 in C:\Users\...\source\repos\1311"*.
 
-To end the session, type **"stop session"** in the chat, press **Q** or Ctrl+C in the VM console, or sign out of Codex from the app. The script stops Codex, signs out and deletes the temp folder.
+To end the session, type **"stop session"** in the chat, press **Q** or Ctrl+C in the VM console, or sign out of Codex from the app. The script stops Codex, signs out and deletes the temp folder. The threads are kept for next time, except the ones you archived in the app (see [Resuming a conversation](#resuming-a-conversation)).
+
+### Resuming a conversation
+
+Conversations are kept when a session stops without being archived: with "stop session", Ctrl+C, or when the VM restarts or the console is closed (the next launch picks them up from the leftover folder). On the next launch, after choosing the agent:
+
+- **Claude Code** lists them, newest first:
+
+  ```
+           Session  [N] New
+                    [1] Fix invoice posting                       12/11 17:42  C:\Users\Admin\source\repos\1311
+                    [2] SSRS customer report                      10/11 09:15  C:\Users\Admin\source\repos\1311
+                    [D] Delete the saved conversations
+           Choose [Enter = N]:
+  ```
+
+  Pick a number and sign in as usual. The session shows up in the Claude app as a **new entry** under the same name, with the whole earlier conversation, and runs in the folder it ran in before. It also shows in the VM console. To end a resumed session, type **"stop session"**: archiving it in the app doesn't stop it. It is kept again, so you can resume it once more.
+- **Codex** only asks whether to keep them (Enter) or delete them (**D**). After signing in and pairing, the ChatGPT app lists them under the VM, and you continue the one you want there.
+
+What is kept is only the transcripts: no login token, no account settings, no skills or plugins synced from your account. Claude Code writes your email into the transcript's context: it is replaced with `redacted` before saving. Each conversation is deleted 7 days after its last use (`-KeepDays` changes that; `-KeepDays 0` keeps nothing).
 
 ### Claude Code and Codex together
 
@@ -134,6 +154,7 @@ You only need these when running the script from PowerShell instead of double-cl
 | `-Name` | `session.ini`, or asked on first run | Session name shown in the Claude app |
 | `-ExtraDirs` | all local fixed drives | Folders the agent may access |
 | `-McpUrl` | `http://127.0.0.1:8080/mcp` | Used only if no `d365` MCP config is found |
+| `-KeepDays` | `7` | Days a conversation is kept for resuming after its last use; `0` keeps nothing |
 
 To force a specific MCP configuration on a VM, put an `mcp.json` next to the script:
 
@@ -160,6 +181,7 @@ The metadata index is not rebuilt. Run `d365fo-mcp index` by hand after a D365FO
 This reduces exposure a lot, but on a machine where others are administrators it can't make you invisible. Be aware that:
 
 - **While the session runs**, the login token is in the temp folder and in process memory. A local admin, or an Azure admin taking a disk snapshot, could read it. When the session ends it is signed out and deleted.
+- **Saved conversations stay on the VM for up to 7 days** (`%LOCALAPPDATA%\remote-session\saved`), readable by anyone using the same Windows account. They contain only what was said and done on that VM: your messages, the answers, the files and command output the agent saw. Your other chats and your account stay out of reach, because no login is kept. They still carry account and organization IDs (not your email), and Codex threads your ChatGPT user ID. Archive the session in the app, choose **D** at the next launch, or use `-KeepDays 0` if nothing at all should stay.
 - **Deleted files are removed normally, not wiped**, so forensic recovery is possible.
 - **The session runs without approvals** (`bypassPermissions` for Claude, `approval_policy = "never"` with no sandbox for Codex): the agent executes commands, edits files and runs MCP tools such as SQL queries without asking. Keep that in mind on customer environments.
 - **Codex remote control is experimental.** On Windows the Codex background daemon refuses to run as administrator, and LCS VMs run the admin account elevated, often with UAC off. So the script runs `codex remote-control --no-daemon` in the foreground and requests the pairing code from its local socket itself, with the same request `codex remote-control pair` sends to the daemon. A future Codex release could change that request.

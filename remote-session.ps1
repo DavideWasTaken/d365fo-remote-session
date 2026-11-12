@@ -12,12 +12,15 @@
 # 5. Starts `claude remote-control` under the chosen name in bypass-permissions mode, or
 #    `codex remote-control` with no approvals and a pairing code for the ChatGPT app.
 # 6. When the session ends (archived in the app, "stop session", or Ctrl+C) it signs out and
-#    deletes the throwaway folder.
+#    deletes the throwaway folder. Unless it was archived, the conversations are kept for
+#    -KeepDays in %LOCALAPPDATA%\remote-session\saved - only the transcripts, never the login -
+#    so the next launch can resume them (Claude: pick one from a list; Codex: the ChatGPT app
+#    lists them again).
 #
 # Usage:    double-click the launcher. Tell the agent which project to use from the chat
 #           ("use project X in Y"): it can access every local drive.
 # Optional: -Agent claude|codex -Project <start folder> -Name <session name> -ExtraDirs <folders>
-#           -McpUrl <url>
+#           -McpUrl <url> -KeepDays <days, 0 = keep nothing>
 
 param(
     # claude or codex; empty = asked on every launch.
@@ -30,11 +33,16 @@ param(
     # Folders the agent may access besides the start folder; empty = every local fixed drive.
     [string[]]$ExtraDirs = @(),
     # Used only when no MCP server with "d365" in its name is configured on the VM.
-    [string]$McpUrl = 'http://127.0.0.1:8080/mcp'
+    [string]$McpUrl = 'http://127.0.0.1:8080/mcp',
+    # Days a conversation is kept for resuming after its last activity; 0 = keep nothing.
+    [ValidateRange(0, 365)]
+    [int]$KeepDays = 7
 )
 
 $ErrorActionPreference = 'Stop'
 $prefixes = @('cc-session-', 'codex-rs-')
+# Conversations kept for resuming: claude\<id>.jsonl + <id>.json, codex\sessions\... (rollouts).
+$savedRoot = Join-Path $env:LOCALAPPDATA 'remote-session\saved'
 # Session name and agent, editable by hand. session-name.txt is where older versions kept the name.
 $settingsFile = Join-Path $PSScriptRoot 'session.ini'
 $legacyNameFile = Join-Path $PSScriptRoot 'session-name.txt'
@@ -131,6 +139,9 @@ function Remove-StaleSessions {
         }
         # A Codex daemon left running from that folder would still be signed in: stop it first.
         Stop-ProcessesUnder $_.FullName
+        # The session ended without cleaning up (VM restarted, console closed): its conversations
+        # are kept just as a normal end would keep them.
+        if (-not (Test-Path (Join-Path $_.FullName 'conversations.done'))) { $null = Save-Conversations $_.FullName }
         if (Remove-Folder $_.FullName 1) { $removed++ }
     }
     return $removed
@@ -290,6 +301,141 @@ function Remove-Folder([string]$path, [int]$attempts = 10) {
         if ($i -lt $attempts - 1) { Start-Sleep -Milliseconds 700 }
     }
     return $false
+}
+
+# ---------------------------------------------------------------- saved conversations
+
+# Only the transcripts are kept between sessions, never the login or anything else from the config
+# folder (account settings, skills and plugins synced from your account, logs).
+
+function ConvertFrom-JsonString([string]$text) {
+    try { return [string]$json.DeserializeObject('"' + $text + '"') } catch { return $text }
+}
+
+# Robocopy merges folders and keeps the timestamps the expiry is based on.
+function Copy-Tree([string]$from, [string]$to) {
+    robocopy $from $to /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP *> $null
+}
+
+# Email of the account signed in to a Claude config folder, read before signing out.
+function Get-ClaudeEmail([string]$configDir) {
+    $cfg = Read-JsonFile (Join-Path $configDir '.claude.json')
+    if ($cfg -and $cfg.ContainsKey('oauthAccount') -and $cfg['oauthAccount'] -is [Collections.IDictionary]) {
+        return [string]$cfg['oauthAccount']['emailAddress']
+    }
+    return ''
+}
+
+# Claude: each transcript goes to saved\claude\<id>.jsonl, with <id>.json saying where it ran.
+# Claude Code writes the account's email into the transcript's context: it is replaced first.
+function Save-ClaudeConversations([string]$configDir, [string]$email) {
+    $limit = (Get-Date).AddDays(-$KeepDays)
+    $target = Join-Path $savedRoot 'claude'
+    $saved = 0
+    foreach ($file in Get-ChildItem (Join-Path $configDir 'projects\*\*.jsonl') -File -Force -ErrorAction SilentlyContinue) {
+        if ($file.LastWriteTime -lt $limit) { continue }
+        $text = [IO.File]::ReadAllText($file.FullName)
+        # The session remote-control creates up front has nothing to resume until someone writes in it.
+        if ($text -notmatch '"type":"user"') { continue }
+        if ($email) { $text = [regex]::Replace($text, [regex]::Escape($email), 'redacted', 'IgnoreCase') }
+        $cwd = if ($text -match '"cwd":"((?:[^"\\]|\\.)*)"') { ConvertFrom-JsonString $Matches[1] } else { '' }
+        $title = ''
+        $titles = [regex]::Matches($text, '"aiTitle":"((?:[^"\\]|\\.)*)"')
+        if ($titles.Count) { $title = ConvertFrom-JsonString $titles[$titles.Count - 1].Groups[1].Value }
+        elseif ($text -match '"role":"user","content":"((?:[^"\\]|\\.)*)"') { $title = ConvertFrom-JsonString $Matches[1] }
+        if (-not (Test-Path $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }
+        $copy = Join-Path $target $file.Name
+        $meta = Join-Path $target ($file.BaseName + '.json')
+        [IO.File]::WriteAllText($copy, $text)
+        Write-JsonFile $meta @{ title = $title; cwd = $cwd; project = $file.Directory.Name }
+        # The date shown in the list and the expiry follow the last use, not the last save.
+        foreach ($f in $copy, $meta) { [IO.File]::SetLastWriteTime($f, $file.LastWriteTime) }
+        $saved++
+    }
+    return $saved
+}
+
+# Codex: the rollout files under sessions\ are merged into saved\codex\sessions; threads archived
+# in the app (moved to archived_sessions\) are dropped. Copied back into a new CODEX_HOME, Codex
+# indexes them again and the ChatGPT app lists them.
+function Save-CodexConversations([string]$codexHome) {
+    $src = Join-Path $codexHome 'sessions'
+    $target = Join-Path $savedRoot 'codex\sessions'
+    if (Test-Path $src) { Copy-Tree $src $target }
+    Get-ChildItem (Join-Path $codexHome 'archived_sessions') -Recurse -Filter 'rollout-*.jsonl' -File -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ChildItem $target -Recurse -Filter $_.Name -File -ErrorAction SilentlyContinue | Remove-Item -Force }
+    return @(Get-ChildItem $src -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue).Count
+}
+
+# Keeps the conversations of a session folder; returns how many were kept.
+function Save-Conversations([string]$folder) {
+    if (-not $KeepDays) { return 0 }
+    try {
+        if ((Split-Path $folder -Leaf) -like 'codex-rs-*') { return Save-CodexConversations $folder }
+        return Save-ClaudeConversations $folder (Get-ClaudeEmail $folder)
+    } catch {
+        Write-Warn "Couldn't keep the conversations: $($_.Exception.Message)"
+        return 0
+    }
+}
+
+# Deletes what hasn't been used for -KeepDays (everything with -KeepDays 0).
+function Remove-ExpiredConversations {
+    if (-not (Test-Path $savedRoot)) { return }
+    $limit = (Get-Date).AddDays(-$KeepDays)
+    Get-ChildItem $savedRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $limit } | Remove-Item -Force -ErrorAction SilentlyContinue
+}
+
+# Lists the saved Claude conversations, newest first, and returns the one picked (or $null: new).
+function Select-ClaudeConversation {
+    $folder = Join-Path $savedRoot 'claude'
+    $saved = @(Get-ChildItem (Join-Path $folder '*.jsonl') -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 9 | ForEach-Object {
+            $meta = Read-JsonFile (Join-Path $folder ($_.BaseName + '.json'))
+            if ($meta) {
+                [pscustomobject]@{ Id = $_.BaseName; File = $_.FullName; Title = [string]$meta['title']
+                                   Cwd = [string]$meta['cwd']; Project = [string]$meta['project']; Time = $_.LastWriteTime }
+            }
+        })
+    if (-not $saved.Count) { return $null }
+
+    Write-Host ""
+    Write-Host "         Session  [N] New"
+    for ($i = 0; $i -lt $saved.Count; $i++) {
+        $c = $saved[$i]
+        $title = if ($c.Title) { $c.Title -replace '\s+', ' ' } else { '(untitled)' }
+        if ($title.Length -gt 40) { $title = $title.Substring(0, 37) + '...' }
+        Write-Host ("                  [{0}] {1,-40}  {2:dd/MM HH:mm}  {3}" -f ($i + 1), $title, $c.Time, $c.Cwd)
+    }
+    Write-Host "                  [D] Delete the saved conversations"
+    $choice = (Read-Host "         Choose [Enter = N]").Trim()
+    if ($choice -ieq 'D') {
+        Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Ok "Saved conversations deleted"
+        return $null
+    }
+    $n = 0
+    if ([int]::TryParse($choice, [ref]$n) -and $n -ge 1 -and $n -le $saved.Count) { return $saved[$n - 1] }
+    return $null
+}
+
+# Codex lists the threads in the ChatGPT app: here you only choose to keep or delete them.
+# Returns $true when they should be copied into the new session.
+function Confirm-CodexConversations {
+    $folder = Join-Path $savedRoot 'codex'
+    $threads = @(Get-ChildItem (Join-Path $folder 'sessions') -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    if (-not $threads.Count) { return $false }
+    Write-Host ""
+    Write-Host ("         Saved    {0} conversation(s), the last one {1:dd/MM HH:mm}" -f $threads.Count, $threads[0].LastWriteTime)
+    $choice = (Read-Host "         [Enter] Resume them in the app   [D] Delete them").Trim()
+    if ($choice -ieq 'D') {
+        Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Ok "Saved conversations deleted"
+        return $false
+    }
+    return $true
 }
 
 function Get-ClaudeStatus {
@@ -658,6 +804,10 @@ $loginProc = $null
 $codexTemp = $null
 $justInstalled = $false
 $signInStarted = $false
+$resume = $null
+$restoreCodex = $false
+$archived = $false
+$keptCount = 0
 
 Write-Banner
 
@@ -752,12 +902,30 @@ try {
     }
     $ExtraDirs = @($ExtraDirs | ForEach-Object { (Resolve-Path $_).Path })
 
-    Write-Field 'Name' $Name
-    Write-Field 'Start in' $Project
-    Write-Field 'Access' ($ExtraDirs -join '  ')
-
+    # First, so the conversations of a session that ended badly can be resumed too.
     $removed = Remove-StaleSessions
     if ($removed) { Write-Info "Removed $removed leftover folder(s) from earlier sessions." }
+    Remove-ExpiredConversations
+
+    if ($isCodex) {
+        $restoreCodex = Confirm-CodexConversations
+    } else {
+        $resume = Select-ClaudeConversation
+        if ($resume -and -not (Test-Path -LiteralPath $resume.Cwd)) {
+            Write-Warn "$($resume.Cwd) no longer exists - starting a new session."
+            $resume = $null
+        }
+        if ($resume) {
+            # The transcript belongs to the folder it ran in: resume it there.
+            $Project = $resume.Cwd
+            $projectKey = $Project.Replace('\', '/').TrimEnd('/')
+        }
+    }
+
+    Write-Field 'Name' $Name
+    if ($resume) { Write-Field 'Resume' $(if ($resume.Title) { $resume.Title } else { $resume.Id }) }
+    Write-Field 'Start in' $Project
+    Write-Field 'Access' ($ExtraDirs -join '  ')
 
     if ($isCodex) {
         # Codex puts a socket in CODEX_HOME\app-server-control and Windows limits its path to 108
@@ -774,6 +942,16 @@ try {
     $PID | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
     Write-Ok "Throwaway config folder ready"
     Write-Dim $dir
+    if ($resume) {
+        $projDir = Join-Path $dir "projects\$($resume.Project)"
+        New-Item -ItemType Directory -Path $projDir -Force | Out-Null
+        Copy-Item -LiteralPath $resume.File -Destination $projDir
+        Write-Ok "Conversation restored"
+    }
+    if ($restoreCodex) {
+        Copy-Tree (Join-Path $savedRoot 'codex\sessions') (Join-Path $dir 'sessions')
+        Write-Ok "Saved conversations restored"
+    }
 
     # -------------------------------------------------------------- 3. MCP servers
     Write-Step "MCP servers"
@@ -793,22 +971,24 @@ try {
     $d365Url = $servers[$d365Name]['url']
     if ($d365Url) { Start-D365Mcp $d365Url }
 
+    # "stop session" in the chat creates stop.request in the config folder, which this script
+    # watches. The command names the folder through the environment, not its path: a resumed
+    # conversation carries the instructions of the session it started in, and that folder is gone.
     $stopFile = Join-Path $dir 'stop.request'
-    $stopScript = Join-Path $dir 'stop.ps1'
+    $kept = if ($KeepDays) { "the conversation stays saved on this machine for $KeepDays days and can be resumed from the launcher" } else { '' }
 
     if ($isCodex) {
         Write-CodexConfig (Join-Path $dir 'config.toml') $servers $Project
-        # Global instructions: Codex reads AGENTS.md from CODEX_HOME. "stop session" works as for Claude.
-        "New-Item -ItemType File -Path '$stopFile' -Force | Out-Null" | Set-Content -Path $stopScript -Encoding ascii
+        # Global instructions: Codex reads AGENTS.md from CODEX_HOME.
         @"
 # Temporary remote session
 - You can work in these folders: $($ExtraDirs -join ', ').
 - When the user names a project or a path ("use project X in Y"), work there, using absolute paths
   to read, edit and run commands. Use get_workspace_info from the d365 MCP to check that the MCP
   points at the same project, and tell the user if it doesn't.
-- When the user writes "stop session" (or "chiudi tutto"), say in one line that you are closing,
+- When the user writes "stop session" (or "chiudi tutto"), say in one line that you are closing$(if ($kept) { " and that $kept" }),
   then run in PowerShell:
-  & '$stopScript'
+  New-Item -ItemType File -Force -Path (Join-Path `$env:CODEX_HOME 'stop.request') | Out-Null
   Remote control stops within a few seconds; the launcher then signs out and cleans up.
 "@ | Set-Content -Path (Join-Path $dir 'AGENTS.md') -Encoding UTF8
         $env:CODEX_HOME = $dir
@@ -832,19 +1012,18 @@ try {
             }
         }
 
-        # "stop session" in the chat creates stop.request: this script sees it and stops Claude
-        # cleanly (Ctrl+C). Claude Code keeps a session stopped that way for resuming, so it stays in
-        # the app as offline; archiving it from the app is what removes it from the list.
-        "New-Item -ItemType File -Path '$stopFile' -Force | Out-Null" | Set-Content -Path $stopScript -Encoding ascii
+        # Claude Code keeps a session stopped with "stop session" for resuming, so it stays in the
+        # app as offline; archiving it from the app is what removes it from the list.
         @"
 # Temporary remote session
 - You can work in these folders: $($ExtraDirs -join ', ').
 - When the user names a project or a path ("use project X in Y"), work there, using absolute paths
   to read, edit and run commands. Use get_workspace_info from the d365 MCP to check that the MCP
   points at the same project, and tell the user if it doesn't.
-- When the user writes "stop session" (or "chiudi tutto"), say in one line that you are closing and
-  that archiving this session in the app also removes it from their list, then run in PowerShell:
-  & '$stopScript'
+- When the user writes "stop session" (or "chiudi tutto"), say in one line that you are closing,
+  $(if ($kept) { "that $kept, " })and that archiving this session in the app removes it from their list,
+  then run in PowerShell:
+  New-Item -ItemType File -Force -Path (Join-Path `$env:CLAUDE_CONFIG_DIR 'stop.request') | Out-Null
   The remote session ends within a few seconds; the launcher then signs out and cleans up.
 "@ | Set-Content -Path (Join-Path $dir 'CLAUDE.md') -Encoding UTF8
 
@@ -976,6 +1155,34 @@ try {
             Start-Sleep -Milliseconds 500
         }
         if ($rc.HasExited -and -not $reason) { Write-Section "Codex remote control stopped - cleaning up..." }
+    } elseif ($resume) {
+        # `remote-control` can only bring a session back for about 4 hours after it stopped. An
+        # interactive session resumed from the transcript has no such limit: it shows in the app as
+        # a new session, with the whole conversation. It also shows in this console.
+        $rcArgs = "--resume $($resume.Id) --remote-control `"$Name`" --permission-mode bypassPermissions"
+        Write-Field 'Session' "$Name  (resumed)"
+        Write-Field 'Mode' 'bypass permissions (no prompts)'
+        Write-Host ""
+        Write-Info "Open '$Name' from the Claude app on your computer: it's a new entry with the earlier conversation."
+        Write-Info "You can close RDP now with the X - do NOT sign out of Windows."
+        Write-Info "To end it: 'stop session' in the chat. Archiving it in the app doesn't stop a resumed session."
+        Write-Host ""
+        Start-Sleep -Seconds 3
+
+        $rc = Start-Process -FilePath $claude -ArgumentList $rcArgs -WorkingDirectory $Project -NoNewWindow -PassThru
+        $rcStart = $rc.StartTime
+        $rc.Id | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
+
+        while (-not $rc.WaitForExit(1000)) {
+            if (Test-Path $stopFile) {
+                # The interactive session wants Ctrl+C twice: stop it directly instead, its
+                # transcript is written as the conversation goes.
+                taskkill /PID $rc.Id /T /F *> $null
+                Clear-Host
+                Write-Section "Stop requested from the session - shutting down..."
+                break
+            }
+        }
     } else {
         $rcArgs = "remote-control --name `"$Name`" --spawn session --permission-mode bypassPermissions"
         Write-Field 'Session' $Name
@@ -983,8 +1190,12 @@ try {
         Write-Host ""
         Write-Info "Open '$Name' from the Claude app on your computer."
         Write-Info "You can close RDP now with the X - do NOT sign out of Windows."
-        Write-Info "To end it: archive the session in the app - that also removes it from your list."
-        Write-Dim "('stop session' in the chat or Ctrl+C here also work, but leave it listed as offline.)"
+        Write-Info "To end it: archive the session in the app - that also deletes the conversation from here."
+        if ($KeepDays) {
+            Write-Dim "('stop session' in the chat or Ctrl+C here keep it for resuming, listed in the app as offline.)"
+        } else {
+            Write-Dim "('stop session' in the chat or Ctrl+C here also work, but leave it listed as offline.)"
+        }
         Write-Host ""
 
         $rc = Start-Process -FilePath $claude -ArgumentList $rcArgs -WorkingDirectory $Project -NoNewWindow -PassThru
@@ -1001,6 +1212,9 @@ try {
                 break
             }
         }
+        # In single-session mode Remote Control exits on its own when the session is archived in
+        # the app: you are done with it, so the conversation isn't kept.
+        if (-not (Test-Path $stopFile)) { $archived = $true }
     }
 }
 catch {
@@ -1025,6 +1239,15 @@ finally {
 
     if ($dir) {
         Write-Section "Cleaning up"
+        # Before signing out: Claude's email, which is removed from the saved transcripts, is read
+        # from the signed-in config.
+        if (-not $archived) {
+            $keptCount = Save-Conversations $dir
+            if ($keptCount) { Write-Ok "$keptCount conversation(s) kept for resuming, for $KeepDays days" }
+        }
+        # A folder that can't be deleted now is removed on the next run: don't keep its
+        # conversations a second time then (or at all, if the session was archived).
+        New-Item -ItemType File -Path (Join-Path $dir 'conversations.done') -Force -ErrorAction SilentlyContinue | Out-Null
         if ($isCodex) {
             if ($rc) { Write-Ok "Remote control stopped" }
             # A daemon left by an older version of this script would run from the folder.
@@ -1074,7 +1297,9 @@ finally {
             Write-Warn "$local exists (permissions saved from a session) - delete it if you don't need it."
         }
         Write-Host ""
-        if ($clean) {
+        if ($clean -and $keptCount) {
+            Write-Host "  Done. You are signed out; only the conversations are kept, in $savedRoot." -ForegroundColor Green
+        } elseif ($clean) {
             Write-Host "  Done. Nothing from this session is left in your $agentName config on this machine." -ForegroundColor Green
         } else {
             Write-Host "  Done. You are signed out; leftover files will be cleaned up next time." -ForegroundColor Green
