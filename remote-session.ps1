@@ -59,6 +59,25 @@ Add-Type -Namespace Win32 -Name ConsoleCtrl -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
 '@
 
+# Notes that Ctrl+C was pressed and passes it on to PowerShell. Claude exits within a second of
+# Ctrl+C, often before PowerShell stops this script, so "Claude exited on its own" alone can't tell
+# a session archived in the app from one stopped here.
+Add-Type @'
+using System.Runtime.InteropServices;
+public static class CtrlCWatch {
+    delegate bool Handler(uint ctrlType);
+    [DllImport("kernel32.dll")] static extern bool SetConsoleCtrlHandler(Handler handler, bool add);
+    static Handler handler;
+    public static volatile bool Pressed;
+    public static void Start() {
+        if (handler != null) return;
+        handler = t => { if (t == 0 || t == 1) Pressed = true; return false; };
+        SetConsoleCtrlHandler(handler, true);
+    }
+}
+'@
+[CtrlCWatch]::Start()
+
 # ---------------------------------------------------------------- output
 
 function Write-Banner {
@@ -808,6 +827,7 @@ $resume = $null
 $restoreCodex = $false
 $archived = $false
 $keptCount = 0
+$sessionStart = $null
 
 Write-Banner
 
@@ -937,6 +957,7 @@ try {
         $dir = Join-Path $env:TEMP ($prefix + [guid]::NewGuid().ToString('N'))
     }
     New-Item -ItemType Directory -Path $dir | Out-Null
+    $sessionStart = Get-Date
     # The launcher's PID: while it runs, another launcher (Claude and Codex side by side) leaves this
     # folder alone, also during sign-in. Claude Code's remote-control PID replaces it once it starts.
     $PID | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
@@ -1213,8 +1234,10 @@ try {
             }
         }
         # In single-session mode Remote Control exits on its own when the session is archived in
-        # the app: you are done with it, so the conversation isn't kept.
-        if (-not (Test-Path $stopFile)) { $archived = $true }
+        # the app: you are done with it, so the conversation isn't kept. Give a Ctrl+C pressed just
+        # now a moment to register first.
+        Start-Sleep -Milliseconds 500
+        if (-not (Test-Path $stopFile) -and -not [CtrlCWatch]::Pressed) { $archived = $true }
     }
 }
 catch {
@@ -1241,9 +1264,16 @@ finally {
         Write-Section "Cleaning up"
         # Before signing out: Claude's email, which is removed from the saved transcripts, is read
         # from the signed-in config.
-        if (-not $archived) {
+        if ($archived) {
+            Write-Ok "Session archived in the app - its conversation isn't kept"
+        } elseif ($KeepDays -and $signInStarted) {
             $keptCount = Save-Conversations $dir
-            if ($keptCount) { Write-Ok "$keptCount conversation(s) kept for resuming, for $KeepDays days" }
+            if ($keptCount) {
+                Write-Ok "$keptCount conversation(s) kept for resuming, for $KeepDays days"
+            } else {
+                $found = @(Get-ChildItem (Join-Path $dir $(if ($isCodex) { 'sessions' } else { 'projects' })) -Recurse -Filter '*.jsonl' -File -Force -ErrorAction SilentlyContinue)
+                Write-Info "No conversation to keep ($($found.Count) transcript(s) found, none with messages)."
+            }
         }
         # A folder that can't be deleted now is removed on the next run: don't keep its
         # conversations a second time then (or at all, if the session was archived).
@@ -1260,6 +1290,16 @@ finally {
         } elseif ($signInStarted -and $claude) {
             & $claude auth logout *> $null
             Write-Ok "Signed out"
+        }
+        # Claude Code logs MCP connections to %LOCALAPPDATA%\claude-cli-nodejs\Cache, outside
+        # CLAUDE_CONFIG_DIR, and the folder names give away your claude.ai connectors.
+        if (-not $isCodex -and $sessionStart) {
+            Get-ChildItem (Join-Path $env:LOCALAPPDATA 'claude-cli-nodejs\Cache\*\mcp-logs-*') -Directory -Force -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    Get-ChildItem $_.FullName -File -Force | Where-Object { $_.CreationTime -ge $sessionStart } |
+                        Remove-Item -Force -ErrorAction SilentlyContinue
+                    if (-not (Get-ChildItem $_.FullName -Force)) { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+                }
         }
         Remove-Item Env:CLAUDE_CONFIG_DIR, Env:BROWSER -ErrorAction SilentlyContinue
 
