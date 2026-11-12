@@ -363,6 +363,24 @@ function Save-CodexConversations([string]$codexHome) {
     if (Test-Path $src) { Copy-Tree $src $target }
     Get-ChildItem (Join-Path $codexHome 'archived_sessions') -Recurse -Filter 'rollout-*.jsonl' -File -Force -ErrorAction SilentlyContinue |
         ForEach-Object { Get-ChildItem $target -Recurse -Filter $_.Name -File -ErrorAction SilentlyContinue | Remove-Item -Force }
+
+    # Thread names (session_index.jsonl, one line per rename, the last one wins): merged into the
+    # saved index, keeping only the threads still saved.
+    $index = Join-Path $codexHome 'session_index.jsonl'
+    $savedIndex = Join-Path $savedRoot 'codex\session_index.jsonl'
+    if (Test-Path $index) {
+        $kept = @{}
+        Get-ChildItem $target -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue |
+            ForEach-Object { $kept[$_.BaseName.Substring([Math]::Max(0, $_.BaseName.Length - 36))] = $true }
+        $byId = [ordered]@{}
+        foreach ($file in $savedIndex, $index) {
+            if (-not (Test-Path $file)) { continue }
+            foreach ($line in Get-Content $file -Encoding UTF8) {
+                if ($line -match '"id"\s*:\s*"([^"]+)"' -and $kept.ContainsKey($Matches[1])) { $byId[$Matches[1]] = $line }
+            }
+        }
+        [IO.File]::WriteAllLines($savedIndex, [string[]]@($byId.Values))
+    }
     return @(Get-ChildItem $src -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue).Count
 }
 
@@ -386,55 +404,177 @@ function Remove-ExpiredConversations {
         Where-Object { $_.LastWriteTime -lt $limit } | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-# Lists the saved Claude conversations, newest first, and returns the one picked (or $null: new).
+function Read-MenuKey { return [Console]::ReadKey($true) }
+
+function Format-When([datetime]$time) {
+    $today = (Get-Date).Date
+    if ($time.Date -eq $today) { return 'today ' + $time.ToString('HH:mm') }
+    if ($time.Date -eq $today.AddDays(-1)) { return 'yesterday ' + $time.ToString('HH:mm') }
+    return $time.ToString('dd/MM HH:mm')
+}
+
+function Limit-Text([string]$text, [int]$length) {
+    $text = ($text -replace '\s+', ' ').Trim()
+    if ($text.Length -gt $length) { return $text.Substring(0, $length - 3) + '...' }
+    return $text
+}
+
+# Arrow-key list of saved conversations, drawn in place. Up/Down or a number moves, Enter picks,
+# Del (or D) deletes the highlighted conversation after a confirmation, Esc picks the first entry.
+# $first is the entry above the list (new session / continue); each item has Title, Time, Detail.
+# $onDelete removes an item's files. Returns the item picked, or $null for the first entry.
+function Show-ConversationMenu([string]$heading, [string]$first, [string]$help, [object[]]$items, [scriptblock]$onDelete) {
+    $list = New-Object Collections.ArrayList
+    foreach ($item in $items) { [void]$list.Add($item) }
+    $sel = 0
+    $width = [Math]::Max(60, [Console]::WindowWidth - 1)
+    $height = $list.Count + 5
+    $status = ''
+
+    # Reserve the lines first, so a console that has to scroll does it before the menu is placed.
+    Write-Host ""
+    1..$height | ForEach-Object { Write-Host "" }
+    $top = [Console]::CursorTop - $height
+
+    $draw = {
+        $lines = @(
+            @{ Text = "         $heading"; Color = 'Cyan' }
+            @{ Text = "         $help"; Color = 'DarkGray' }
+            @{ Text = ''; Color = 'Gray' }
+            @{ Text = "  $first"; Color = 'White'; Index = 0 }
+        )
+        for ($i = 0; $i -lt $list.Count; $i++) {
+            $c = $list[$i]
+            $title = if ($c.Title) { Limit-Text $c.Title 44 } else { '(untitled)' }
+            $left = [Math]::Max(0, [int][Math]::Ceiling($KeepDays - ((Get-Date) - $c.Time).TotalDays))
+            $text = "  {0,2}  {1,-44}  {2,-15}  {3,-7}  {4}" -f ($i + 1), $title, (Format-When $c.Time), "${left}d left", $c.Detail
+            $lines += @{ Text = $text; Color = 'Gray'; Index = $i + 1 }
+        }
+        $lines += @{ Text = $status; Color = 'Yellow' }
+        for ($row = 0; $row -lt $height; $row++) {
+            [Console]::SetCursorPosition(0, $top + $row)
+            if ($row -lt $lines.Count) {
+                $line = $lines[$row]
+                $text = $line.Text
+                if ($text.Length -gt $width) { $text = $text.Substring(0, $width) }
+                if ($line.ContainsKey('Index') -and $line.Index -eq $sel) {
+                    Write-Host ('>' + $text.Substring(1)).PadRight($width) -NoNewline -ForegroundColor Black -BackgroundColor Cyan
+                } else {
+                    Write-Host $text.PadRight($width) -NoNewline -ForegroundColor $line.Color
+                }
+            } else {
+                Write-Host (''.PadRight($width)) -NoNewline
+            }
+        }
+    }
+
+    $cursor = [Console]::CursorVisible
+    [Console]::CursorVisible = $false
+    try {
+        while ($true) {
+            & $draw
+            $status = ''
+            $key = Read-MenuKey
+            switch ($key.Key) {
+                'UpArrow'   { if ($sel -gt 0) { $sel-- } }
+                'DownArrow' { if ($sel -lt $list.Count) { $sel++ } }
+                'Home'      { $sel = 0 }
+                'End'       { $sel = $list.Count }
+                'Escape'    { return $null }
+                'Enter'     { if ($sel -eq 0) { return $null } else { return $list[$sel - 1] } }
+                default {
+                    $n = 0
+                    if ([int]::TryParse([string]$key.KeyChar, [ref]$n) -and $n -ge 1 -and $n -le $list.Count) {
+                        $sel = $n
+                    } elseif (($key.Key -eq 'Delete' -or $key.Key -eq 'D') -and $sel -gt 0) {
+                        $c = $list[$sel - 1]
+                        $name = if ($c.Title) { Limit-Text $c.Title 44 } else { '(untitled)' }
+                        $status = "         Delete '$name'? Y = yes, any other key = no"
+                        & $draw
+                        if ((Read-MenuKey).Key -eq 'Y') {
+                            & $onDelete $c
+                            $list.RemoveAt($sel - 1)
+                            if ($sel -gt $list.Count) { $sel = $list.Count }
+                            $status = "         Deleted '$name'."
+                            if (-not $list.Count) { & $draw; return $null }
+                        } else {
+                            $status = ''
+                        }
+                    }
+                }
+            }
+        }
+    } finally {
+        [Console]::CursorVisible = $cursor
+        [Console]::SetCursorPosition(0, $top + $height)
+    }
+}
+
+# Lets you pick a saved Claude conversation to resume, or delete some; returns the one picked
+# ($null: new session).
 function Select-ClaudeConversation {
     $folder = Join-Path $savedRoot 'claude'
     $saved = @(Get-ChildItem (Join-Path $folder '*.jsonl') -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending | Select-Object -First 9 | ForEach-Object {
+        Sort-Object LastWriteTime -Descending | Select-Object -First 15 | ForEach-Object {
             $meta = Read-JsonFile (Join-Path $folder ($_.BaseName + '.json'))
             if ($meta) {
                 [pscustomobject]@{ Id = $_.BaseName; File = $_.FullName; Title = [string]$meta['title']
-                                   Cwd = [string]$meta['cwd']; Project = [string]$meta['project']; Time = $_.LastWriteTime }
+                                   Cwd = [string]$meta['cwd']; Project = [string]$meta['project']
+                                   Time = $_.LastWriteTime; Detail = [string]$meta['cwd'] }
             }
         })
     if (-not $saved.Count) { return $null }
-
-    Write-Host ""
-    Write-Host "         Session  [N] New"
-    for ($i = 0; $i -lt $saved.Count; $i++) {
-        $c = $saved[$i]
-        $title = if ($c.Title) { $c.Title -replace '\s+', ' ' } else { '(untitled)' }
-        if ($title.Length -gt 40) { $title = $title.Substring(0, 37) + '...' }
-        Write-Host ("                  [{0}] {1,-40}  {2:dd/MM HH:mm}  {3}" -f ($i + 1), $title, $c.Time, $c.Cwd)
-    }
-    Write-Host "                  [D] Delete the saved conversations"
-    $choice = (Read-Host "         Choose [Enter = N]").Trim()
-    if ($choice -ieq 'D') {
-        Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Ok "Saved conversations deleted"
-        return $null
-    }
-    $n = 0
-    if ([int]::TryParse($choice, [ref]$n) -and $n -ge 1 -and $n -le $saved.Count) { return $saved[$n - 1] }
-    return $null
+    return Show-ConversationMenu 'Saved conversations' 'New session' `
+        'Up/Down choose   Enter open   Del delete   Esc new session' $saved {
+            param($c)
+            Remove-Item -LiteralPath $c.File, ([IO.Path]::ChangeExtension($c.File, '.json')) -Force -ErrorAction SilentlyContinue
+        }
 }
 
-# Codex lists the threads in the ChatGPT app: here you only choose to keep or delete them.
-# Returns $true when they should be copied into the new session.
+# Thread names Codex keeps in session_index.jsonl, by thread id.
+function Get-CodexThreadNames([string]$indexFile) {
+    $names = @{}
+    if (Test-Path $indexFile) {
+        foreach ($line in Get-Content $indexFile -Encoding UTF8) {
+            try { $entry = $json.DeserializeObject($line) } catch { continue }
+            if ($entry -is [Collections.IDictionary] -and $entry['id'] -and $entry['thread_name']) { $names[[string]$entry['id']] = [string]$entry['thread_name'] }
+        }
+    }
+    return $names
+}
+
+# Title of a Codex thread: its name, or else your first message (skipping the instructions and
+# environment Codex adds before it).
+function Get-CodexThreadTitle([IO.FileInfo]$rollout, $names) {
+    $id = $rollout.BaseName.Substring([Math]::Max(0, $rollout.BaseName.Length - 36))
+    if ($names.ContainsKey($id)) { return $names[$id] }
+    foreach ($line in [IO.File]::ReadLines($rollout.FullName)) {
+        if ($line -notlike '*"role":"user"*') { continue }
+        try { $content = $json.DeserializeObject($line)['payload']['content'] } catch { continue }
+        foreach ($part in @($content)) {
+            $text = [string]$part['text']
+            if ($text -and -not $text.StartsWith('<') -and -not $text.StartsWith('# AGENTS.md')) { return $text }
+        }
+    }
+    return ''
+}
+
+# Codex lists the saved threads in the ChatGPT app, where you pick one: here you can look at them
+# and delete some. Returns $true when the ones left should be copied into the new session.
 function Confirm-CodexConversations {
     $folder = Join-Path $savedRoot 'codex'
+    $names = Get-CodexThreadNames (Join-Path $folder 'session_index.jsonl')
     $threads = @(Get-ChildItem (Join-Path $folder 'sessions') -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending)
+        Sort-Object LastWriteTime -Descending | Select-Object -First 15 | ForEach-Object {
+            [pscustomobject]@{ File = $_.FullName; Title = (Get-CodexThreadTitle $_ $names); Time = $_.LastWriteTime; Detail = '' }
+        })
     if (-not $threads.Count) { return $false }
-    Write-Host ""
-    Write-Host ("         Saved    {0} conversation(s), the last one {1:dd/MM HH:mm}" -f $threads.Count, $threads[0].LastWriteTime)
-    $choice = (Read-Host "         [Enter] Resume them in the app   [D] Delete them").Trim()
-    if ($choice -ieq 'D') {
-        Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Ok "Saved conversations deleted"
-        return $false
-    }
-    return $true
+    $null = Show-ConversationMenu 'Saved conversations - you continue them from the ChatGPT app' 'Continue' `
+        'Up/Down choose   Del delete   Enter continue' $threads {
+            param($c)
+            Remove-Item -LiteralPath $c.File -Force -ErrorAction SilentlyContinue
+        }
+    return [bool](Get-ChildItem (Join-Path $folder 'sessions') -Recurse -Filter 'rollout-*.jsonl' -File -ErrorAction SilentlyContinue)
 }
 
 function Get-ClaudeStatus {
@@ -951,6 +1091,8 @@ try {
     }
     if ($restoreCodex) {
         Copy-Tree (Join-Path $savedRoot 'codex\sessions') (Join-Path $dir 'sessions')
+        $savedIndex = Join-Path $savedRoot 'codex\session_index.jsonl'
+        if (Test-Path $savedIndex) { Copy-Item $savedIndex (Join-Path $dir 'session_index.jsonl') }
         Write-Ok "Saved conversations restored"
     }
 
