@@ -58,26 +58,6 @@ $json.MaxJsonLength = [int]::MaxValue
 Add-Type -Namespace Win32 -Name ConsoleCtrl -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
 '@
-
-# Notes that Ctrl+C was pressed and passes it on to PowerShell. Claude exits within a second of
-# Ctrl+C, often before PowerShell stops this script, so "Claude exited on its own" alone can't tell
-# a session archived in the app from one stopped here.
-Add-Type @'
-using System.Runtime.InteropServices;
-public static class CtrlCWatch {
-    delegate bool Handler(uint ctrlType);
-    [DllImport("kernel32.dll")] static extern bool SetConsoleCtrlHandler(Handler handler, bool add);
-    static Handler handler;
-    public static volatile bool Pressed;
-    public static void Start() {
-        if (handler != null) return;
-        handler = t => { if (t == 0 || t == 1) Pressed = true; return false; };
-        SetConsoleCtrlHandler(handler, true);
-    }
-}
-'@
-[CtrlCWatch]::Start()
-
 # ---------------------------------------------------------------- output
 
 function Write-Banner {
@@ -1233,11 +1213,13 @@ try {
                 break
             }
         }
-        # In single-session mode Remote Control exits on its own when the session is archived in
-        # the app: you are done with it, so the conversation isn't kept. Give a Ctrl+C pressed just
-        # now a moment to register first.
-        Start-Sleep -Milliseconds 500
-        if (-not (Test-Path $stopFile) -and -not [CtrlCWatch]::Pressed) { $archived = $true }
+        # In single-session mode Remote Control exits on its own both when the session is archived in
+        # the app and on Ctrl+C here: it reads the keyboard itself, so Ctrl+C never reaches this
+        # script as a signal. On Ctrl+C it keeps a pointer for `remote-control --continue`
+        # (projects\<folder>\bridge-pointer.json); an archived session has none. Archived means
+        # you are done with it, so the conversation isn't kept.
+        $pointer = Get-ChildItem (Join-Path $dir 'projects\*\bridge-pointer.json') -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path $stopFile) -and -not $pointer) { $archived = $true }
     }
 }
 catch {
