@@ -20,7 +20,7 @@
 # Usage:    double-click the launcher. Tell the agent which project to use from the chat
 #           ("use project X in Y"): it can access every local drive.
 # Optional: -Agent claude|codex -Project <start folder> -Name <session name> -ExtraDirs <folders>
-#           -McpUrl <url> -KeepDays <days, 0 = keep nothing>
+#           -McpUrl <url> -KeepDays <days, 0 = keep nothing> -ShowClaudeConsole
 
 param(
     # claude or codex; empty = asked on every launch.
@@ -36,7 +36,9 @@ param(
     [string]$McpUrl = 'http://127.0.0.1:8080/mcp',
     # Days a conversation is kept for resuming after its last activity; 0 = keep nothing.
     [ValidateRange(0, 365)]
-    [int]$KeepDays = 7
+    [int]$KeepDays = 7,
+    # Show the local Claude Code console when resuming, for troubleshooting.
+    [switch]$ShowClaudeConsole
 )
 
 $ErrorActionPreference = 'Stop'
@@ -225,6 +227,69 @@ function Stop-ChildProcesses([int]$parentId, [datetime]$from, [datetime]$until) 
             Stop-ChildProcesses $_.ProcessId $_.CreationDate ([datetime]::Now)
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
         }
+}
+
+# A hidden console doesn't close with the launcher. Windows closes this job handle even if
+# PowerShell is terminated before its finally block, stopping Claude and its children.
+function New-ClaudeResumeJob {
+    if (-not ('Win32.ClaudeResumeJob' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Win32 {
+    public static class ClaudeResumeJob {
+        [StructLayout(LayoutKind.Sequential)]
+        struct BasicLimits {
+            public long ProcessTime, JobTime;
+            public uint Flags;
+            public UIntPtr MinWorkingSet, MaxWorkingSet;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass, SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct ExtendedLimits {
+            public BasicLimits Basic;
+            public ulong ReadOperations, WriteOperations, OtherOperations;
+            public ulong ReadBytes, WriteBytes, OtherBytes;
+            public UIntPtr ProcessMemory, JobMemory, PeakProcessMemory, PeakJobMemory;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern SafeFileHandle CreateJobObject(IntPtr attributes, IntPtr name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetInformationJobObject(SafeFileHandle job, int infoClass, ref ExtendedLimits limits, int size);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool AssignProcessToJobObject(SafeFileHandle job, IntPtr process);
+
+        public static SafeFileHandle Create() {
+            const int extendedLimitInformation = 9;
+            const uint killOnJobClose = 0x2000;
+            var job = CreateJobObject(IntPtr.Zero, IntPtr.Zero);
+            if (job.IsInvalid) throw new Win32Exception();
+            var limits = new ExtendedLimits();
+            limits.Basic.Flags = killOnJobClose;
+            if (SetInformationJobObject(job, extendedLimitInformation, ref limits, Marshal.SizeOf(limits))) return job;
+            var error = new Win32Exception();
+            job.Dispose();
+            throw error;
+        }
+
+        public static void Attach(SafeFileHandle job, Process process) {
+            if (process.HasExited || AssignProcessToJobObject(job, process.Handle)) return;
+            var error = new Win32Exception();
+            if (!process.HasExited) throw error;
+        }
+    }
+}
+'@
+    }
+    return [Win32.ClaudeResumeJob]::Create()
 }
 
 # Stops the processes whose executable lives in a folder (the Codex daemon installs its own copy of
@@ -1038,6 +1103,7 @@ $codexTemp = $null
 $justInstalled = $false
 $signInStarted = $false
 $resume = $null
+$resumeJob = $null
 $restoreCodex = $false
 $archived = $false
 $keptCount = 0
@@ -1246,7 +1312,7 @@ try {
             projects                      = @{ $projectKey = @{ hasTrustDialogAccepted = $true } }
         }
         # No permission prompts; also accept the MCP servers in the project's .mcp.json.
-        Write-JsonFile (Join-Path $dir 'settings.json') @{
+        $claudeSettings = @{
             enableAllProjectMcpServers        = $true
             skipDangerousModePermissionPrompt = $true
             permissions                       = @{
@@ -1254,6 +1320,11 @@ try {
                 additionalDirectories = $ExtraDirs
             }
         }
+        if ($resume -and -not $ShowClaudeConsole) {
+            # Skip the fullscreen renderer invitation, which would wait for input in the hidden console.
+            $claudeSettings.env = @{ CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN = '1' }
+        }
+        Write-JsonFile (Join-Path $dir 'settings.json') $claudeSettings
 
         # Claude Code keeps a session stopped with "stop session" for resuming, so it stays in the
         # app as offline; archiving it from the app is what removes it from the list.
@@ -1408,30 +1479,33 @@ try {
     } elseif ($resume) {
         # `remote-control` can only bring a session back for about 4 hours after it stopped. An
         # interactive session resumed from the transcript has no such limit: it shows in the app as
-        # a new session, with the whole conversation. It also shows in this console.
+        # a new session, with the whole conversation. Give Claude its own console so it
+        # still has a terminal without drawing its interactive UI over the launcher.
         $rcArgs = "--resume $($resume.Id) --remote-control `"$Name`" --permission-mode bypassPermissions"
         Write-Field 'Session' "$Name  (resumed)"
         Write-Field 'Mode' 'bypass permissions (no prompts)'
         Write-Host ""
         Write-Info "Open '$Name' from the Claude app on your computer: it's a new entry with the earlier conversation."
         Write-Info "You can close RDP now with the X - do NOT sign out of Windows."
-        Write-Info "To end it: 'stop session' in the chat. Archiving it in the app doesn't stop a resumed session."
+        Write-Info "To end it: 'stop session' in the chat or Ctrl+C here."
+        Write-Dim "Archiving it in the app doesn't stop a resumed session."
         Write-Host ""
-        Start-Sleep -Seconds 3
 
-        $rc = Start-Process -FilePath $claude -ArgumentList $rcArgs -WorkingDirectory $Project -NoNewWindow -PassThru
+        $consoleStyle = if ($ShowClaudeConsole) { 'Normal' } else { 'Hidden' }
+        $resumeJob = New-ClaudeResumeJob
+        $rc = Start-Process -FilePath $claude -ArgumentList $rcArgs -WorkingDirectory $Project -WindowStyle $consoleStyle -PassThru
+        [Win32.ClaudeResumeJob]::Attach($resumeJob, $rc)
         $rcStart = $rc.StartTime
         $rc.Id | Set-Content -Path (Join-Path $dir 'rc.pid') -Encoding ascii
 
         while (-not $rc.WaitForExit(1000)) {
             if (Test-Path $stopFile) {
-                # The interactive session wants Ctrl+C twice: stop it directly instead, its
-                # transcript is written as the conversation goes.
-                taskkill /PID $rc.Id /T /F *> $null
-                Clear-Host
                 Write-Section "Stop requested from the session - shutting down..."
                 break
             }
+        }
+        if ($rc.HasExited -and $rc.ExitCode -ne 0) {
+            throw "Claude Code couldn't resume the session (exit code $($rc.ExitCode))."
         }
     } else {
         $rcArgs = "remote-control --name `"$Name`" --spawn session --permission-mode bypassPermissions"
@@ -1479,10 +1553,12 @@ finally {
     # Cleanup must always run to the end, whatever the native commands print on stderr.
     $ErrorActionPreference = 'Continue'
 
-    # Give Claude time to archive the session before signing out (Codex time to stop after Ctrl+C);
-    # kill it if that's not enough.
+    # A resumed Claude process doesn't receive Ctrl+C from this console. Closing its job stops it;
+    # its transcript is written as it goes. Give agents sharing this console time to stop.
+    if ($resumeJob) { $resumeJob.Dispose() }
     if ($rc) {
-        if (-not $rc.HasExited -and -not $rc.WaitForExit($(if ($isCodex) { 10000 } else { 30000 }))) {
+        $exitTimeout = if ($resume) { 2000 } elseif ($isCodex) { 10000 } else { 30000 }
+        if (-not $rc.WaitForExit($exitTimeout)) {
             taskkill /PID $rc.Id /T /F *> $null
         }
         if ($rcStart) { Stop-ChildProcesses $rc.Id $rcStart ([datetime]::Now) }

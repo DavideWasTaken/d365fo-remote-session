@@ -104,7 +104,7 @@ Conversations are kept when a session stops without being archived: with "stop s
      2  SSRS customer report                          yesterday 12:48  6d left  C:\Users\Admin\source\repos\1311
   ```
 
-  Move with the arrows (or press the number) and press Enter to resume one, or Enter on *New session* (Esc) for a new one. **Del** (or **D**) deletes the highlighted conversation, after asking you to confirm with **Y**. Then sign in as usual. The session shows up in the Claude app as a **new entry** under the same name, with the whole earlier conversation, and runs in the folder it ran in before. It also shows in the VM console. To end a resumed session, type **"stop session"**: archiving it in the app doesn't stop it. It is kept again, so you can resume it once more.
+  Move with the arrows (or press the number) and press Enter to resume one, or Enter on *New session* (Esc) for a new one. **Del** (or **D**) deletes the highlighted conversation, after asking you to confirm with **Y**. Then sign in as usual. The session shows up in the Claude app as a **new entry** under the same name, with the whole earlier conversation, and runs in the folder it ran in before. The VM console stays on the launcher. To stop a resumed session, type **"stop session"** in the chat or press **Ctrl+C** in the VM console. Archiving it in the app doesn't stop it. The conversation is kept again so you can resume it once more.
 - **Codex** shows the same list, with the thread names from the app. There you only delete the ones you don't want (**Del**). Enter continues: after signing in, the ChatGPT app lists the threads left under the VM, and you continue the one you want there.
 
   Codex registers the VM with the ChatGPT app as a remote computer, and a new registration has to be paired again and shows up without the earlier threads. So the registration is kept too: from Codex's state database only the `remote_control_enrollments` table (the computer's ids and name), everything else in it emptied, plus Codex's `installation_id`. The next session registers as the same computer.
@@ -158,6 +158,7 @@ You only need these when running the script from PowerShell instead of double-cl
 | `-ExtraDirs` | all local fixed drives | Folders the agent may access |
 | `-McpUrl` | `http://127.0.0.1:8080/mcp` | Used only if no `d365` MCP config is found |
 | `-KeepDays` | `7` | Days a conversation is kept for resuming after its last use; `0` keeps nothing |
+| `-ShowClaudeConsole` | off | Opens the console for a resumed Claude session so you can see errors or retry `/remote-control` |
 
 To force a specific MCP configuration on a VM, put an `mcp.json` next to the script:
 
