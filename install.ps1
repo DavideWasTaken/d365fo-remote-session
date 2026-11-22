@@ -1,15 +1,15 @@
-# Installs d365fo-remote-session:
+# Installs Pocket Session for D365 F&O:
 # - Documents\remote-session\remote-session.ps1 and session.ini (session name)
 # - Desktop\Remote Session.cmd, the double-click launcher
 # - Documents\remote-session\update-mcp.ps1 and Desktop\Update d365fo-mcp.cmd, when d365fo-mcp is installed
 # Replaces an install of the old d365fo-claude-remote-session, keeping its session name.
 #
-# Usage:  irm https://raw.githubusercontent.com/DavideWasTaken/d365fo-remote-session/main/install.ps1 | iex
+# Usage:  irm https://raw.githubusercontent.com/DavideWasTaken/pocket-session-d365fo/main/install.ps1 | iex
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$repo = 'DavideWasTaken/d365fo-remote-session'
+$repo = 'DavideWasTaken/pocket-session-d365fo'
 # Download from the latest commit rather than /main: raw.githubusercontent.com caches /main for a few
 # minutes, so right after a push it can still serve the previous version.
 try {
@@ -31,8 +31,8 @@ $oldDir = Join-Path $documents 'claude-remote-session'
 $oldLauncher = Join-Path $desktop 'Claude Remote Session.cmd'
 
 Write-Host ""
-Write-Host "  D365FO Remote Session - installer" -ForegroundColor Cyan
-Write-Host "  ---------------------------------" -ForegroundColor DarkCyan
+Write-Host "  Pocket Session for D365 F&O installer" -ForegroundColor Cyan
+Write-Host "  ------------------------------------" -ForegroundColor DarkCyan
 
 try {
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -63,7 +63,7 @@ try {
 
     @"
 @echo off
-rem Starts a disposable Claude Code or Codex remote session (d365fo-remote-session).
+rem Starts a Claude Code or Codex remote session for D365 F&O.
 powershell -NoProfile -ExecutionPolicy Bypass -File "$script" %*
 pause
 "@ | Set-Content -Path $launcher -Encoding ascii
@@ -79,7 +79,7 @@ pause
         Invoke-WebRequest "$repoRaw/update-mcp.ps1" -OutFile $updater -UseBasicParsing
         @"
 @echo off
-rem Updates d365fo-mcp and restarts its server (d365fo-remote-session).
+rem Updates d365fo-mcp and restarts its server.
 powershell -NoProfile -ExecutionPolicy Bypass -File "$updater" %*
 pause
 "@ | Set-Content -Path $updaterLauncher -Encoding ascii

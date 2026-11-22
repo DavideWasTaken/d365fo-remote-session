@@ -1,10 +1,10 @@
-# d365fo-remote-session
+# Pocket Session for D365 F&O
 
-Start a disposable **Claude Code Remote Control** or **Codex remote control** session on a customer's VM with one double-click, and drive it from your own machine. Nothing of your account stays on the VM.
+Start a temporary **Claude Code Remote Control** or **OpenAI Codex remote control** session on a **Dynamics 365 Finance & Operations** development VM and continue from your own device. The PowerShell launcher gives the agent D365 F&O workspace instructions, starts `d365fo-mcp` when the configured HTTP endpoint is down, and removes the temporary sign-in profile when the session ends.
 
-> Formerly `d365fo-claude-remote-session`. Codex support is **experimental**: `codex remote-control` is itself marked experimental by OpenAI.
+> Codex support is **experimental**.
 
-It was built for **Dynamics 365 Finance & Operations** development VMs (LCS cloud-hosted environments) and works together with [d365fo-mcp-server](https://github.com/dynamics365ninja/d365fo-mcp-server). It works on any Windows machine where you want Claude Code or Codex without leaving your login behind.
+This edition is designed for LCS-hosted development VMs and works with [d365fo-mcp-server](https://github.com/dynamics365ninja/d365fo-mcp-server). For a general-purpose Windows launcher, see [Pocket Session](https://github.com/DavideWasTaken/pocket-session).
 
 ## Why
 
@@ -44,7 +44,7 @@ This script lets you:
 On the VM, open PowerShell and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/DavideWasTaken/d365fo-remote-session/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/DavideWasTaken/pocket-session-d365fo/main/install.ps1 | iex
 ```
 
 It asks for a session name (for example the customer's name, or press Enter to use the computer name), then creates:
